@@ -134,37 +134,43 @@ impl Registry {
 
     fn start_working(&self, index: usize) {
         log!(StartWorking { index: index });
-        let mut state = self.state.lock().unwrap();
-        state.threads_at_work += 1;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.threads_at_work += 1;
+        }
         self.work_available.notify_all();
     }
 
     pub unsafe fn inject_deferred(&self, job: Box<Job>) {
         log!(InjectJobs { count: 1 });
-        let mut state = self.state.lock().unwrap();
-        if state.terminate {
-            drop(state);
-            // See the comment in inject about this case.
-            panic!("rayon thread pool is contaminated by a previous panic; recovery is only available on nightly compilers");
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.terminate {
+                drop(state);
+                // See the comment in inject about this case.
+                panic!("rayon thread pool is contaminated by a previous panic; recovery is only available on nightly compilers");
+            }
+            state.injected_jobs.push_back(InjectedJob::Deferred(JobBox(job)));
         }
-        state.injected_jobs.push_back(InjectedJob::Deferred(JobBox(job)));
         self.work_available.notify_all();
     }
 
     pub unsafe fn inject(&self, injected_jobs: &[JobRef]) {
         log!(InjectJobs { count: injected_jobs.len() });
-        let mut state = self.state.lock().unwrap();
-        if state.terminate {
-            drop(state);
-            // We can only reach this point if these conditions are met:
-            // 1) This must be the global thread pool
-            // 2) The only way to terminate the global thread pool is if a
-            //    worker thread panics.
-            // 3) A worker thread can only panic if a job panicked and was not
-            //    caught by panic::recover.
-            panic!("rayon thread pool is contaminated by a previous panic; recovery is only available on nightly compilers");
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.terminate {
+                drop(state);
+                // We can only reach this point if these conditions are met:
+                // 1) This must be the global thread pool
+                // 2) The only way to terminate the global thread pool is if a
+                //    worker thread panics.
+                // 3) A worker thread can only panic if a job panicked and was not
+                //    caught by panic::recover.
+                panic!("rayon thread pool is contaminated by a previous panic; recovery is only available on nightly compilers");
+            }
+            state.injected_jobs.extend(injected_jobs.iter().cloned().map(InjectedJob::Ref));
         }
-        state.injected_jobs.extend(injected_jobs.iter().cloned().map(InjectedJob::Ref));
         self.work_available.notify_all();
     }
 
@@ -189,6 +195,7 @@ impl Registry {
             // bit dubious, but then so is the opposite.
             if let Some(job) = state.injected_jobs.pop_front() {
                 state.threads_at_work += 1;
+                mem::drop(state);
                 self.work_available.notify_all();
                 return Work::Job(job);
             }
@@ -218,11 +225,13 @@ impl Registry {
     }
 
     pub fn terminate(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.terminate = true;
-        for job in state.injected_jobs.drain(..) {
-            unsafe {
-                job.abort();
+        {
+            let mut state = self.state.lock().unwrap();
+            state.terminate = true;
+            for job in state.injected_jobs.drain(..) {
+                unsafe {
+                    job.abort();
+                }
             }
         }
         self.work_available.notify_all();
