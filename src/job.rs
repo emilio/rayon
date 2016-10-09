@@ -60,8 +60,7 @@ impl<L: Latch> DeferredJobImpl<L> {
     }
 }
 
-impl<L: Latch> Job for DeferredJobImpl<L>
-{
+impl<L: Latch> Job for DeferredJobImpl<L> {
     unsafe fn execute(&self) {
         // Use a guard here to ensure that the latch is always set, even if
         // the function panics.

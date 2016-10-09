@@ -11,8 +11,10 @@ use std::sync::{Arc, Condvar, Mutex, Once, ONCE_INIT};
 use std::thread;
 use std::collections::VecDeque;
 use std::mem;
+use std::time::Duration;
 use util::leak;
 use num_cpus;
+
 
 ///////////////////////////////////////////////////////////////////////////
 
@@ -270,7 +272,8 @@ impl ThreadInfo {
 pub struct WorkerThread {
     worker: Worker<InjectedJob>,
     stealers: Vec<Stealer<InjectedJob>>,
-    index: usize
+    index: usize,
+    deque_index_mask: u32,
 }
 
 // This is a bit sketchy, but basically: the WorkerThread is
@@ -343,16 +346,45 @@ impl WorkerThread {
     }
 
     unsafe fn steal_work(&self) -> Option<InjectedJob> {
+        const SPINS_UNTIL_BACKOFF: u32 = 128;
+        const BACKOFF_INCREMENT_IN_NS: u32 = 5000;
+        const BACKOFFS_UNTIL_CONTROL_CHECK: u32 = 6;
+
         if self.stealers.is_empty() { return None }
-        let start = rand::random::<usize>() % self.stealers.len();
-        let (lo, hi) = self.stealers.split_at(start);
-        hi.iter().chain(lo)
-            .filter_map(|stealer| match stealer.steal() {
-                Stolen::Empty => None,
-                Stolen::Abort => None, // loop?
-                Stolen::Data(v) => Some(v),
-            })
-            .next()
+
+        let mut back_off_duration = Duration::new(0, 0);
+
+        // Become a thief.
+        let mut i = 0;
+        loop {
+            // Don't just use `rand % len` because that's slow on ARM.
+            let mut victim;
+            loop {
+                victim = rand::random::<u32>() & self.deque_index_mask;
+                if (victim as usize) < self.stealers.len() {
+                    break
+                }
+            }
+
+            match self.stealers[victim as usize].steal() {
+                Stolen::Data(work) => return Some(work),
+                Stolen::Empty | Stolen::Abort => {}
+            }
+
+            if i > SPINS_UNTIL_BACKOFF {
+                if back_off_duration.subsec_nanos() >=
+                    BACKOFF_INCREMENT_IN_NS * BACKOFFS_UNTIL_CONTROL_CHECK {
+                    return None;
+                }
+
+                thread::sleep(back_off_duration);
+
+                back_off_duration += Duration::new(0, BACKOFF_INCREMENT_IN_NS);
+                i = 0
+            } else {
+                i += 1
+            }
+        }
     }
 }
 
@@ -362,12 +394,14 @@ unsafe fn main_loop(worker: Worker<InjectedJob>, registry: Arc<Registry>, index:
     let stealers = registry.thread_infos.iter()
         .enumerate().filter(|&(i, _)| i != index)
         .map(|(_, ti)| ti.stealer.clone())
-        .collect();
+        .collect::<Vec<_>>();
 
+    let deque_index_mask = (stealers.len() as u32).next_power_of_two() - 1;
     let worker_thread = WorkerThread {
         worker: worker,
         stealers: stealers,
         index: index,
+        deque_index_mask: deque_index_mask,
     };
     worker_thread.set_current();
 
