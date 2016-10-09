@@ -5,7 +5,7 @@ use job::{Job, JobRef, JobBox};
 use latch::{Latch, LockLatch, SpinLatch};
 #[allow(unused_imports)]
 use log::Event::*;
-use rand;
+use rand::{self, Rng};
 use std::cell::Cell;
 use std::sync::{Arc, Condvar, Mutex, Once, ONCE_INIT};
 use std::thread;
@@ -274,6 +274,7 @@ pub struct WorkerThread {
     stealers: Vec<Stealer<InjectedJob>>,
     index: usize,
     deque_index_mask: u32,
+    rng: rand::XorShiftRng,
 }
 
 // This is a bit sketchy, but basically: the WorkerThread is
@@ -282,8 +283,8 @@ pub struct WorkerThread {
 // worker is fully unwound. Using an unsafe pointer avoids the need
 // for a RefCell<T> etc.
 thread_local! {
-    static WORKER_THREAD_STATE: Cell<*const WorkerThread> =
-        Cell::new(0 as *const WorkerThread)
+    static WORKER_THREAD_STATE: Cell<*mut WorkerThread> =
+        Cell::new(0 as *mut _)
 }
 
 impl WorkerThread {
@@ -291,13 +292,13 @@ impl WorkerThread {
     /// NULL if this is not a worker thread. This pointer is valid
     /// anywhere on the current thread.
     #[inline]
-    pub unsafe fn current() -> *const WorkerThread {
+    pub unsafe fn current() -> *mut WorkerThread {
         WORKER_THREAD_STATE.with(|t| t.get())
     }
 
     /// Sets `self` as the worker thread index for the current thread.
     /// This is done during worker thread startup.
-    unsafe fn set_current(&self) {
+    unsafe fn set_current(&mut self) {
         WORKER_THREAD_STATE.with(|t| {
             assert!(t.get().is_null());
             t.set(self);
@@ -322,7 +323,7 @@ impl WorkerThread {
     }
 
     #[cold]
-    pub unsafe fn steal_until(&self, latch: &SpinLatch) {
+    pub unsafe fn steal_until(&mut self, latch: &SpinLatch) {
         // If another thread stole our job when we panic, we must halt unwinding
         // until that thread is finished using it.
         struct PanicGuard<'a>(&'a SpinLatch);
@@ -345,7 +346,7 @@ impl WorkerThread {
         mem::forget(guard);
     }
 
-    unsafe fn steal_work(&self) -> Option<InjectedJob> {
+    unsafe fn steal_work(&mut self) -> Option<InjectedJob> {
         const SPINS_UNTIL_BACKOFF: u32 = 128;
         const BACKOFF_INCREMENT_IN_NS: u32 = 5000;
         const BACKOFFS_UNTIL_CONTROL_CHECK: u32 = 6;
@@ -360,7 +361,7 @@ impl WorkerThread {
             // Don't just use `rand % len` because that's slow on ARM.
             let mut victim;
             loop {
-                victim = rand::random::<u32>() & self.deque_index_mask;
+                victim = self.rng.next_u32() & self.deque_index_mask;
                 if (victim as usize) < self.stealers.len() {
                     break
                 }
@@ -397,11 +398,12 @@ unsafe fn main_loop(worker: Worker<InjectedJob>, registry: Arc<Registry>, index:
         .collect::<Vec<_>>();
 
     let deque_index_mask = (stealers.len() as u32).next_power_of_two() - 1;
-    let worker_thread = WorkerThread {
+    let mut worker_thread = WorkerThread {
         worker: worker,
         stealers: stealers,
         index: index,
         deque_index_mask: deque_index_mask,
+        rng: rand::weak_rng(),
     };
     worker_thread.set_current();
 
